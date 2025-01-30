@@ -13,7 +13,7 @@ SECTIONS {
     }
 
     .data : ALIGN(4) {
-        *(.data.data.*);
+        *(.data .data.*);
     }
 
     .bss : ALIGN(4) {
@@ -21,7 +21,7 @@ SECTIONS {
         *(.bss .bss.* .sbss .sbss.*);
         __bss_end = .;
     }
-    
+
     . = ALIGN(4);
     . += 128 * 1024; /* 128KB */
     __stack_top = .;
