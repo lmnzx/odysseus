@@ -1,7 +1,9 @@
 #include "kernel.h"
 #include "common.h"
 
-extern char __bss[], __bss_end[], __stack_top[];
+extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
+
+struct process procs[PROCS_MAX];
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -25,8 +27,20 @@ struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
 
 void putchar(char ch) { sbi_call(ch, 0, 0, 0, 0, 0, 0, 1); }
 
+paddr_t alloc_pages(uint32_t n) {
+    static paddr_t next_paddr = (paddr_t)__free_ram;
+    paddr_t paddr = next_paddr;
+    next_paddr += n * PAGE_SIZE;
+
+    if (next_paddr > (paddr_t)__free_ram_end)
+        PANIC("out of memory");
+
+    memset((void *)paddr, 0, n * PAGE_SIZE);
+    return paddr;
+}
+
 __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
-    __asm__ __volatile__("csrw sscratch, sp\n"
+    __asm__ __volatile__("csrrw sp, sscratch, sp\n"
                          "addi sp, sp, -4 * 31\n"
                          "sw ra,  4 * 0(sp)\n"
                          "sw gp,  4 * 1(sp)\n"
@@ -56,11 +70,12 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
                          "sw s7,  4 * 25(sp)\n"
                          "sw s8,  4 * 26(sp)\n"
                          "sw s9,  4 * 27(sp)\n"
-                         "sw s10, 4 * 28(sp)\n"
-                         "sw s11, 4 * 29(sp)\n"
 
                          "csrr a0, sscratch\n"
-                         "sw a0, 4 * 30(sp)\n"
+                         "sw a0,  4 * 30(sp)\n"
+
+                         "addi a0, sp, 4 * 31\n"
+                         "csrw sscratch, a0\n"
 
                          "mv a0, sp\n"
                          "call handle_trap\n"
@@ -108,15 +123,145 @@ void handle_trap(struct trap_frame *f) {
           user_pc);
 }
 
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,
+                                           uint32_t *next_sp) {
+    __asm__ __volatile__("addi sp, sp, -13 * 4\n"
+                         "sw ra,  0  * 4(sp)\n"
+                         "sw s0,  1  * 4(sp)\n"
+                         "sw s1,  2  * 4(sp)\n"
+                         "sw s2,  3  * 4(sp)\n"
+                         "sw s3,  4  * 4(sp)\n"
+                         "sw s4,  5  * 4(sp)\n"
+                         "sw s5,  6  * 4(sp)\n"
+                         "sw s6,  7  * 4(sp)\n"
+                         "sw s7,  8  * 4(sp)\n"
+                         "sw s8,  9  * 4(sp)\n"
+                         "sw s9,  10 * 4(sp)\n"
+                         "sw s10, 11 * 4(sp)\n"
+                         "sw s11, 12 * 4(sp)\n"
+
+                         "sw sp, (a0)\n"
+                         "lw sp, (a1)\n"
+
+                         "lw ra,  0  * 4(sp)\n"
+                         "lw s0,  1  * 4(sp)\n"
+                         "lw s1,  2  * 4(sp)\n"
+                         "lw s2,  3  * 4(sp)\n"
+                         "lw s3,  4  * 4(sp)\n"
+                         "lw s4,  5  * 4(sp)\n"
+                         "lw s5,  6  * 4(sp)\n"
+                         "lw s6,  7  * 4(sp)\n"
+                         "lw s7,  8  * 4(sp)\n"
+                         "lw s8,  9  * 4(sp)\n"
+                         "lw s9,  10 * 4(sp)\n"
+                         "lw s10, 11 * 4(sp)\n"
+                         "lw s11, 12 * 4(sp)\n"
+                         "addi sp, sp, 13 * 4\n"
+                         "ret\n");
+}
+
+struct process *create_process(uint32_t pc) {
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slots");
+
+    uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
+    *--sp = 0;            // s11
+    *--sp = 0;            // s10
+    *--sp = 0;            // s9
+    *--sp = 0;            // s8
+    *--sp = 0;            // s7
+    *--sp = 0;            // s6
+    *--sp = 0;            // s5
+    *--sp = 0;            // s4
+    *--sp = 0;            // s3
+    *--sp = 0;            // s2
+    *--sp = 0;            // s1
+    *--sp = 0;            // s0
+    *--sp = (uint32_t)pc; // ra
+
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t)sp;
+    return proc;
+}
+
+struct process *current_proc;
+struct process *idle_proc;
+
+void yield(void) {
+    struct process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+
+    if (next == current_proc)
+        return;
+
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)]));
+
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
+}
+
+void sleep(void) {
+    for (int i = 0; i < 30000000; i++)
+        __asm__ __volatile__("nop");
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
+void proc_a_entry(void) {
+    printf("starting process A\n");
+    while (1) {
+        putchar('A');
+        yield();
+    }
+}
+
+void proc_b_entry(void) {
+    printf("starting process B\n");
+    while (1) {
+        putchar('B');
+        yield();
+    }
+}
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
 
     WRITE_CSR(stvec, (uint32_t)kernel_entry);
-    __asm__ __volatile__("unimp");
 
-    for (;;) {
-        __asm__ __volatile__("wfi");
-    }
+    idle_proc = create_process((uint32_t)NULL);
+    idle_proc->pid = -1; // idle
+    current_proc = idle_proc;
+
+    proc_a = create_process((uint32_t)proc_a_entry);
+    proc_b = create_process((uint32_t)proc_b_entry);
+
+    yield();
+    PANIC("switched to idle process");
+
+    /*for (;;) {*/
+    /*    __asm__ __volatile__("wfi");*/
+    /*}*/
 }
 
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
