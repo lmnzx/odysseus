@@ -26,6 +26,13 @@
         __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp));                \
     } while (0)
 
+#define SATP_SV32 (1u << 31)
+#define PAGE_V (1 << 0)
+#define PAGE_R (1 << 1)
+#define PAGE_W (1 << 2)
+#define PAGE_X (1 << 3)
+#define PAGE_U (1 << 4)
+
 struct sbiret {
     long error;
     long value;
@@ -69,5 +76,6 @@ struct process {
     int pid;
     int state;
     vaddr_t sp;
+    uint8_t *page_table;
     uint8_t stack[8192];
 };
